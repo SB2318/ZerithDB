@@ -7,19 +7,28 @@ import type {
   InsertResult,
   UpdateSpec,
 } from "zerithdb-core";
-import { ZerithDBError, ErrorCode } from "zerithdb-core";
+import { ZerithDBError, ErrorCode, EventEmitter } from "zerithdb-core";
 import { wrapIDBOperation } from "./internal/wrap-idb-operation.js";
 import type { BackupExportOptions, BackupSnapshot } from "./backup.js";
+
+type CollectionEvents<T extends Record<string, any>> = {
+  mutation: { collectionName: string; doc: Document<T>; type: "insert" | "update" | "delete" };
+};
 
 /**
  * A handle to a single named collection within the ZerithDB local database.
  * All operations are async and backed by IndexedDB.
  */
-export class CollectionClient<T extends Record<string, any> = Record<string, any>> {
+export class CollectionClient<
+  T extends Record<string, any> = Record<string, any>
+> extends EventEmitter<CollectionEvents<T>> {
   constructor(
     private readonly table: Table<Document<T>>,
-    private readonly collectionName: string
-  ) {}
+    private readonly collectionName: string,
+    private readonly peerId: string
+  ) {
+    super();
+  }
 
   /**
    * Subscribe to changes in the collection.
@@ -39,7 +48,7 @@ export class CollectionClient<T extends Record<string, any> = Record<string, any
 
   /**
    * Insert a new document into the collection.
-   * Automatically assigns `_id`, `_createdAt`, and `_updatedAt`.
+   * Automatically assigns `_id`, `_createdAt`, `_updatedAt`, `_vclock`, and `_lamport`.
    */
   async insert(document: T): Promise<InsertResult> {
     if (document === null || document === undefined) {
@@ -52,6 +61,9 @@ export class CollectionClient<T extends Record<string, any> = Record<string, any
       _id: id,
       _createdAt: now,
       _updatedAt: now,
+      _vclock: { [this.peerId]: 1 },
+      _lamport: now,
+      _deleted: false,
     };
 
     return wrapIDBOperation(
@@ -59,6 +71,7 @@ export class CollectionClient<T extends Record<string, any> = Record<string, any
       `Failed to insert into collection "${this.collectionName}"`,
       async () => {
         await this.table.add(doc);
+        this.emit("mutation", { collectionName: this.collectionName, doc, type: "insert" });
         return { id };
       }
     );
@@ -85,6 +98,9 @@ export class CollectionClient<T extends Record<string, any> = Record<string, any
       _id: uuidv7(),
       _createdAt: now,
       _updatedAt: now,
+      _vclock: { [this.peerId]: 1 },
+      _lamport: now,
+      _deleted: false,
     })) as Document<T>[];
 
     return wrapIDBOperation(
@@ -92,6 +108,9 @@ export class CollectionClient<T extends Record<string, any> = Record<string, any
       `Failed to bulk insert into collection "${this.collectionName}"`,
       async () => {
         await this.table.bulkAdd(docs);
+        for (const doc of docs) {
+          this.emit("mutation", { collectionName: this.collectionName, doc, type: "insert" });
+        }
         return docs.map((d) => ({ id: d._id }));
       }
     );
@@ -99,13 +118,7 @@ export class CollectionClient<T extends Record<string, any> = Record<string, any
 
   /**
    * Find documents matching a filter.
-   * All filter fields are ANDed together.
-   *
-   * @example
-   * ```typescript
-   * const active = await todos.find({ done: false });
-   * const high = await todos.find({ priority: { $gte: 3 } });
-   * ```
+   * Excludes documents marked as deleted by default.
    */
   async find(filter: QueryFilter<T> = {}): Promise<Document<T>[]> {
     return wrapIDBOperation(
@@ -114,7 +127,7 @@ export class CollectionClient<T extends Record<string, any> = Record<string, any
       async () => {
         const all = await this.table.toArray();
         const compiledFilter = this.precompileRegexes(filter);
-        return all.filter((doc) => this.matchesFilter(doc, compiledFilter));
+        return all.filter((doc) => !doc._deleted && this.matchesFilter(doc, compiledFilter));
       }
     );
   }
@@ -126,7 +139,10 @@ export class CollectionClient<T extends Record<string, any> = Record<string, any
     return wrapIDBOperation(
       ErrorCode.DB_READ_FAILED,
       `Failed to get document "${id}" from "${this.collectionName}"`,
-      () => this.table.get(id)
+      async () => {
+        const doc = await this.table.get(id);
+        return doc && !doc._deleted ? doc : undefined;
+      }
     );
   }
 
@@ -152,14 +168,26 @@ export class CollectionClient<T extends Record<string, any> = Record<string, any
       async () => {
         const matches = await this.find(filter);
         const now = Date.now();
-        await this.table.bulkPut(matches.map((doc) => this.applyUpdateSpec(doc, spec, now)));
+
+        const updatedDocs = matches.map((doc) => {
+          const next = this.applyUpdateSpec(doc, spec, now);
+          next._vclock = { ...doc._vclock, [this.peerId]: (doc._vclock[this.peerId] || 0) + 1 };
+          next._lamport = Math.max(doc._lamport, now) + 1;
+          return next;
+        });
+
+        await this.table.bulkPut(updatedDocs);
+        for (const doc of updatedDocs) {
+          this.emit("mutation", { collectionName: this.collectionName, doc, type: "update" });
+        }
+
         return matches.length;
       }
     );
   }
 
   /**
-   * Delete documents matching a filter.
+   * Logical delete documents matching a filter (tombstone).
    * Returns the number of deleted documents.
    */
   async delete(filter: QueryFilter<T>): Promise<number> {
@@ -168,14 +196,36 @@ export class CollectionClient<T extends Record<string, any> = Record<string, any
       `Failed to delete documents from "${this.collectionName}"`,
       async () => {
         const matches = await this.find(filter);
-        await this.table.bulkDelete(matches.map((d) => d._id));
+        const now = Date.now();
+
+        const deletedDocs = matches.map((doc) => ({
+          ...doc,
+          _deleted: true,
+          _updatedAt: now,
+          _vclock: { ...doc._vclock, [this.peerId]: (doc._vclock[this.peerId] || 0) + 1 },
+          _lamport: Math.max(doc._lamport, now) + 1,
+        }));
+
+        await this.table.bulkPut(deletedDocs);
+        for (const doc of deletedDocs) {
+          this.emit("mutation", { collectionName: this.collectionName, doc, type: "delete" });
+        }
+
         return matches.length;
       }
     );
   }
 
   /**
-   * Delete every document in the collection.
+   * For internal use by SyncEngine to apply remote updates deterministically.
+   */
+  async applyRemoteUpdate(doc: Document<T>): Promise<void> {
+    await this.table.put(doc);
+    // Note: We don't emit "mutation" here to avoid echo loops in SyncEngine
+  }
+
+  /**
+   * Delete every document in the collection (Hard delete).
    */
   async clearAll(): Promise<void> {
     return wrapIDBOperation(
@@ -303,8 +353,9 @@ class ZerithDBDexie extends Dexie {
    */
   ensureCollection(name: string): Table {
     if (!this.tableMap.has(name)) {
-      this._currentSchema[name] = "_id, _createdAt, _updatedAt";
-
+      this._currentSchema[name] = "_id, _createdAt, _updatedAt, _lamport, _deleted";
+      this._currentSchema["_sync_logs"] = "++_id, collectionName, docId, timestamp";
+      
       // We must increment the version for every new collection added dynamically
       const nextVersion = Math.max(this.verno, this._pendingVersion) + 1;
       this._pendingVersion = nextVersion;
@@ -315,9 +366,13 @@ class ZerithDBDexie extends Dexie {
 
       this.version(nextVersion).stores(this._currentSchema);
       this.tableMap.set(name, this.table(name));
+      this.tableMap.set("_sync_logs", this.table("_sync_logs"));
     }
-    // biome-ignore lint: map guarantees this is defined
     return this.tableMap.get(name)!;
+  }
+
+  get syncLogs(): Table {
+    return this.table("_sync_logs");
   }
 }
 
@@ -330,10 +385,13 @@ export class DbClient {
   private readonly appId: string;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private readonly collections = new Map<string, CollectionClient<any>>();
+  public readonly peerId: string;
 
   constructor(config: ZerithDBConfig) {
     this.appId = config.appId;
     this.dexie = new ZerithDBDexie(config.appId);
+    // Simplified peerId generation - in production this should be stable
+    this.peerId = uuidv7();
   }
 
   collection<T extends Record<string, any>>(name: string): CollectionClient<T> {
@@ -342,9 +400,20 @@ export class DbClient {
     }
     if (!this.collections.has(name)) {
       const table = this.dexie.ensureCollection(name);
-      this.collections.set(name, new CollectionClient<T>(table as Table<Document<T>>, name));
+      this.collections.set(
+        name,
+        new CollectionClient<T>(table as Table<Document<T>>, name, this.peerId)
+      );
     }
     return this.collections.get(name) as CollectionClient<T>;
+  }
+
+  async logConflict(log: any): Promise<void> {
+    await this.dexie.syncLogs.add(log);
+  }
+
+  async getSyncLogs(): Promise<any[]> {
+    return this.dexie.syncLogs.toArray();
   }
 
   async getMemoryStats(): Promise<{ recordCount: number; collections: Record<string, number> }> {
@@ -371,7 +440,7 @@ export class DbClient {
    * Returns names of all collections currently stored in IndexedDB.
    */
   allCollectionNames(): string[] {
-    return this.dexie.tables.map((t) => t.name);
+    return this.dexie.tables.map((t) => t.name).filter((name) => !name.startsWith("_"));
   }
 
   /**
@@ -400,6 +469,7 @@ export class DbClient {
       }
     );
   }
+
   async dispose(): Promise<void> {
     this.dexie.close();
   }

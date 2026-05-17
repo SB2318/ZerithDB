@@ -35,6 +35,12 @@ export interface SyncConfig {
   transport?: "auto" | "websocket" | "polling";
 
   /**
+   * Per-collection merge policies for conflict resolution.
+   * Defaults to 'lww' (Last-Writer-Wins) if not specified.
+   */
+  mergePolicies?: Record<string, "lww" | "crdt" | ((local: any, remote: any) => any)>;
+
+  /**
    * Configuration options for low-latency ephemeral sync state.
    */
   ephemeral?: EphemeralConfig;
