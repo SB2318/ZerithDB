@@ -2,7 +2,7 @@
  * Enumeration of all structured error codes in ZerithDB.
  * Use these to handle specific error conditions in application code.
  */
-export const enum ErrorCode {
+export enum ErrorCode {
   // Database errors
   DB_INIT_FAILED = "DB_INIT_FAILED",
   DB_WRITE_FAILED = "DB_WRITE_FAILED",
@@ -10,6 +10,7 @@ export const enum ErrorCode {
   DB_DELETE_FAILED = "DB_DELETE_FAILED",
   DB_MIGRATION_FAILED = "DB_MIGRATION_FAILED",
   DB_QUOTA_EXCEEDED = "DB_QUOTA_EXCEEDED",
+  DB_VALIDATION_FAILED = "DB_VALIDATION_FAILED",
 
   // Sync errors
   SYNC_INIT_FAILED = "SYNC_INIT_FAILED",
@@ -49,7 +50,10 @@ export const enum ErrorCode {
  * try {
  *   await app.db("todos").insert(doc);
  * } catch (err) {
- *   if (err instanceof ZerithDBError && err.code === ErrorCode.DB_QUOTA_EXCEEDED) {
+ *   if (
+ *     err instanceof ZerithDBError &&
+ *     err.code === ErrorCode.DB_QUOTA_EXCEEDED
+ *   ) {
  *     // handle storage full
  *   }
  * }
@@ -60,10 +64,11 @@ export class ZerithDBError extends Error {
 
   constructor(code: ErrorCode, message: string, options?: ErrorOptions) {
     super(message, options);
+
     this.name = "ZerithDBError";
     this.code = code;
 
-    // Maintains proper prototype chain in older envs
+    // Maintains proper prototype chain in older environments
     Object.setPrototypeOf(this, new.target.prototype);
   }
 

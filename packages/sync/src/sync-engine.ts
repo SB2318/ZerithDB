@@ -26,6 +26,7 @@ export class SyncEngine extends EventEmitter<SyncEvents> {
   readonly ephemeral: EphemeralStateManager;
 
   private _enabled = false;
+  
   private _state: SyncState = { synced: false, pendingUpdates: 0, connectedPeers: 0 };
   private activeCollections = new Set<string>();
   readonly outbox: OutboxQueue<Document<any>>;
@@ -34,7 +35,8 @@ export class SyncEngine extends EventEmitter<SyncEvents> {
   constructor(
     private readonly config: ZerithDBConfig,
     private readonly db: DbClient,
-    private readonly network: NetworkManager
+    private readonly network: NetworkManager,
+    private readonly auth: AuthManager
   ) {
     super();
     this.ephemeral = new EphemeralStateManager(config, network);
@@ -63,15 +65,36 @@ export class SyncEngine extends EventEmitter<SyncEvents> {
     this.ephemeral.enable();
     this.updateState({ synced: true, connectedPeers: this.network.connectedPeerCount });
     void this.flushOutbox();
+
+    // Start background anti-entropy sync (every 100ms) to guarantee strong eventual consistency
+    this.antiEntropyTimer = setInterval(() => {
+      this.triggerAntiEntropy();
+    }, 100);
   }
 
   disable(): void {
     this._enabled = false;
     this.network.off("message", this.onPeerUpdate);
     this.network.off("peer:connected", this.onPeerConnected);
-    this.network.off("peer:disconnected", this.onPeerDisconnected);
+  this.network.off("peer:disconnected", this.onPeerDisconnected);
     this.ephemeral.disable();
     this.updateState({ synced: false, connectedPeers: 0 });
+
+    if (this.antiEntropyTimer) {
+      clearInterval(this.antiEntropyTimer);
+      this.antiEntropyTimer = null;
+    }
+  }
+
+  private triggerAntiEntropy(): void {
+    if (!this._enabled || this.network.connectedPeerCount === 0) return;
+    for (const [collectionName, doc] of this.docs.entries()) {
+      const stateVector = Y.encodeStateVector(doc);
+      this.network.broadcast({
+        type: "sync-request",
+        payload: this.encodeMessage(collectionName, stateVector),
+      });
+    }
   }
 
   get state(): Readonly<SyncState> {
@@ -208,18 +231,33 @@ export class SyncEngine extends EventEmitter<SyncEvents> {
     }
   }
 
-  private onPeerConnected(): void {
+  private onPeerConnected(peer: { peerId: string }): void {
+  const peerId = peer.peerId;
     this.updateState({ connectedPeers: this.network.connectedPeerCount });
+    void this.sendCapability(peerId);
     void this.flushOutbox();
+
+    if (peer?.peerId) {
+      for (const [collectionName, doc] of this.docs.entries()) {
+        const stateVector = Y.encodeStateVector(doc);
+        this.network.sendTo(peer.peerId, {
+          type: "sync-request",
+          payload: this.encodeMessage(collectionName, stateVector),
+        });
+      }
+    }
   }
 
-  private onPeerDisconnected(): void {
+  private onPeerDisconnected(peer: { peerId: string }): void {
+  const peerId = peer.peerId;
+    this.peerCapabilities.delete(peerId);
     this.updateState({ connectedPeers: this.network.connectedPeerCount });
   }
 
   private async flushOutbox(): Promise<void> {
     if (!this._enabled) return;
     if (this.network.connectedPeerCount === 0) return;
+    if (this.isFlushing) return;
 
     try {
       const pending = await this.outbox.getPending();
